@@ -1,0 +1,179 @@
+########################
+# LD analysis based population (in-house R script)
+########################
+```
+library(RColorBrewer)
+library(corrplot)
+spe = c("EAS","EUR","AMR")
+library(LDlinkR)
+library(gaston)
+a = read.table('tspan5.txt',sep='\t',header=F,quote='',stringsAsFactors=F)
+
+#get a dataframe with: column 1 the position of each snp; column 2 rsid of each snp
+b = a[,c(4,2)]
+b = unique(b)
+colnames(b) = c("pos",'snp_id')
+b = b[order(b[,1],decreasing=F),]
+for(i in spe){
+	LDinfo <- LDmatrix(snps = b$snp_id, 
+                   pop = i, r2d = "r2", 
+                   token = '7a11e5eaea72', 
+                   file =FALSE)
+	rownames(LDinfo) = LDinfo$RS_number
+	LDinfo = LDinfo[,-1]
+	LDinfos = LDinfo[,apply(LDinfo,2,function(y) any(!is.na(y)))]
+	LDinfoss = LDinfos[apply(LDinfos,1,function(y) any(!is.na(y))),]
+	write.table(LDinfoss,paste("maf05",i,sep='_'),sep='\t',row.names=T,col.names=T,quote=F)
+	print(i)
+}
+
+#plot LD heatmap of each species
+for(i in 1:length(files)){
+	outname = files[i]
+	LDinfoss = read.table(files[i],sep='\t',header=T,quote='',stringsAsFactors=F)
+	LDinfoss = LDinfoss[bb$snp_id,bb$snp_id]
+	pdf(paste(outname,'pdf',sep='.'))
+	LD.plot(LDinfoss, snp.positions = bb$pos[which(bb$snp_id %in% rownames(LDinfoss))], write.ld = NULL)
+	dev.off()
+	print(i)
+}
+```
+
+########################
+# Differentially expressed analysis of GEO dataset (in-house R script)
+########################
+```
+library(dplyr)
+library(magrittr)
+library(limma)
+library(dplyr)
+library(data.table)
+library(ggplot2) 
+library(ggsci)
+library(stringr)
+library(reshape2)
+
+#Functions
+read_gse_matrix <- function(matrix_file) {
+	if (!file.exists(matrix_file)) return(NULL)
+	matrix_raw <- readr::read_lines(matrix_file);
+
+    matrix_boundary <- stringr::str_which(matrix_raw, 'series_matrix_table');
+	if (diff(matrix_boundary) == 2L) return(NULL); # only a header line, no data to read
+    
+	matrix_raw[seq(matrix_boundary[1] + 1, matrix_boundary[2] - 1)] %>%
+    	I() %>% readr::read_tsv(T, readr::cols(.default = 'c')) %>% 
+        rm_problematic_row() %>% 
+        {suppressWarnings(dplyr::mutate_at(., -1, as.double))}
+}
+
+rm_problematic_row <- function(data) {
+	problematic_row <- unique(readr::problems(data)$row);
+	if (length(problematic_row) > 0L) data %<>% dplyr::slice(-problematic_row);
+	data %T>% {attr(., c('problems')) <- NULL}
+}
+
+a = read.table('GSEid.txt')
+colnames(a) =c("GSE","Array")
+genes = read.table('tspan_family.txt',sep='\t',header=F,quote='',stringsAsFactors=F)
+total =  NULL
+outdir = "step2_geo"
+dir.create("step2_geo")
+for(i in 1:nrow(a)){
+	gse_file = paste(a$GSE[i],'_series_matrix.txt.gz',sep='')
+	array_file = paste(a$Array[i],'.txt',sep='')
+	metadata = paste(a$GSE[i],'_sample.txt',sep='')
+	expression_data = read_gse_matrix(gse_file)
+	expression_matrix = data.frame(expression_data)
+	array_data = read.table(array_file,sep='\t',header=T,quote='',stringsAsFactors=F)
+	array_data = array_data[,1:2]
+	colnames(array_data) = c("ID_REF","Gene")
+	if( length(expression_matrix$ID_REF) == length(unique(expression_matrix$ID_REF))){
+		datas = expression_matrix
+		} else {
+			datas <- aggregate( .~ID_REF, data=expression_matrix, mean)
+		}
+	rownames(datas) = datas$ID_REF
+	datas = datas[,-1]	
+	meta_data = read.table(metadata,sep='\t',header=T,quote='',stringsAsFactors=F)
+	datas = datas[,meta_data$GSE]
+	qx <- as.numeric(quantile(datas, c(0., 0.25, 0.5, 0.75, 0.99, 1.0), na.rm=T))
+	LogC <- (qx[5] > 100) || (qx[6]-qx[1] > 50 && qx[2] > 0) || (qx[2] > 0 && qx[2] < 1 && qx[4] > 1 && qx[4] < 2)
+	if (LogC) { 
+		# ex[which(ex <= 0)] <- NaN 
+		exprSet <- log2(datas)
+		print("log2 transform finished")
+		} else {
+		exprSet <- datas
+		print("log2 transform not needed")
+		}
+	Group = factor(meta_data$GROUP, levels = c("control","case"))
+	design = model.matrix(~Group)
+	fit = lmFit(exprSet,design)
+	fit = eBayes(fit)
+	deg = topTable(fit,coef=2,number = Inf,confint = T)
+	deg = mutate(deg,ID_REF=rownames(deg))
+	array_data = array_data[!duplicated(array_data$ID_REF),]     
+	tmp = mutate(datas,ID_REF=rownames(datas))
+	tmpp <- inner_join(tmp,array_data,by="ID_REF")
+	tmps <- tmpp[which(tmpp$Gene %in% genes[,1]),]
+	for(j in genes[,1]){
+		tmps$Genes[grepl(j,tmps$Gene)] = paste(j,1:sum(str_count(tmps$Gene,j)),sep='')
+	}
+	gseid = as.character(a$GSE[i])
+	# plot_box
+	melt_file = pre_boxp_function(tmps,meta_data,gseid)
+	for(jiyin in unique(melt_file$Genes)){
+		jiyin_part = melt_file[which(melt_file$Genes %in% jiyin),]
+		ylim1 = boxplot.stats(jiyin_part$value)$stats[c(1, 5)]
+		pdf(paste(outdir,paste(jiyin,gseid,"pdf",sep='.'),sep='/'),w=4,h=5)
+		print(ggplot(jiyin_part, aes(x=Group, y=value, fill=Group)) + geom_boxplot(notch=TRUE, position=position_dodge(0.85), outlier.colour= NA) + labs(title = paste("Gene",jiyin,sep=' '),x=NULL,y="Expression normalized",fill=NULL) + scale_fill_manual(values=c("#FED439","#8CACE1")) + coord_cartesian(ylim = ylim1*1.5) + theme_bw() + theme(legend.position=c(.85, .95),plot.title = element_text(hjust = 0.5, vjust = -6,face = "bold.italic"))) 
+		dev.off()
+	}
+	deg <- inner_join(deg,array_data,by="ID_REF")
+	deg <- aggregate( .~Gene, data=deg[,c(1:8,10)], mean)
+	degs = deg[which(deg$Gene %in% genes[,1]),]
+	diffexp <- data.frame(Symbol = degs$Gene,
+                        log2FC = degs$logFC,
+                        pvalue = degs$adj.P.Val,
+                        CI.L = degs$CI.L,
+                        CI.R = degs$CI.R)
+	diffexp$dataset = a$GSE[i]
+	diffexp$Case = nrow(meta_data[which(meta_data$GROUP %in% 'case'),])
+	diffexp$Control = nrow(meta_data[which(meta_data$GROUP %in% 'control'),])
+	total = rbind(total, diffexp)
+	write.table(degs,paste(outdir,paste(a$GSE[i],'candidate.txt',sep='_'),sep='/'),sep='\t',row.names=F,col.names=T,quote=F)
+	print(a$GSE[i])
+}
+oott = data.table(total)
+oott1 = oott[,.(Symbol,lfci = sprintf("%.2f (%.2f~%.2f)",log2FC, CI.L, CI.R),P=pvalue,log2FC,CI.L,CI.R,Case,Control),
+             by=dataset]
+write.table(oott1, "GEO_dea_result.txt",sep='\t',row.names=F,col.names=T,quote=F)
+```
+
+########################
+# Statistical analysis (PLINK:frequency)
+########################
+export PATH=$PATH:/home/software/1.90b6.15;
+plink --file rs --freq --out freq
+
+########################
+# Statistical analysis (PLINK:hardy-weinberg)
+########################
+export PATH=$PATH:/home/software/1.90b6.15;
+plink --file rs --hardy --out hardy
+
+########################
+# Statistical analysis (PLINK:logistic regression)
+########################
+plink --allow-no-sex --bfile rs --ci 0.95 --keep KD_include.id --logistic sex --out glm
+
+########################
+# Statistical analysis (PLINK:allele association test)
+########################
+plink --allow-no-sex --assoc --bfile rs --keep KD_include.id --out assoc
+
+########################
+# Statistical analysis (PLINK:genotype association test)
+########################
+plink --file rs --model --out model
